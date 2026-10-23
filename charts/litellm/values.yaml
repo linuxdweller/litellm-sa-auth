@@ -1,0 +1,184 @@
+replicaCount: 1
+numWorkers: 1
+
+image:
+  repository: ghcr.io/berriai/litellm
+  pullPolicy: IfNotPresent
+  tag: "v1.100.1"
+
+imagePullSecrets: []
+nameOverride: "litellm"
+fullnameOverride: ""
+
+serviceAccount:
+  # The chart does not create a ServiceAccount; set name to use an existing one.
+  # The pod's SA token is used to fetch the cluster JWKS for saAuth, which any
+  # SA may do by default (system:service-account-issuer-discovery).
+  name: ""
+
+deploymentLabels: {}
+deploymentMinReadySeconds: 0
+
+podAnnotations: {}
+podLabels: {}
+
+strategy: {}
+
+terminationGracePeriodSeconds: 90
+topologySpreadConstraints: []
+
+podSecurityContext: {}
+securityContext: {}
+
+# Names of existing Secrets / ConfigMaps whose keys are loaded as env vars
+# (e.g. provider API keys referenced as os.environ/... in proxy_config).
+environmentSecrets: []
+environmentConfigMaps: []
+
+service:
+  type: ClusterIP
+  port: 4000
+  annotations: {}
+
+httproute:
+  enabled: false
+  gateway:
+    name: ""
+    namespace: ""
+  hostnames: []
+  timeouts:
+    request: 3600s
+    backendRequest: 3600s
+
+# Lets in-cluster pods authenticate to LiteLLM with JUST their own
+# ServiceAccount token -- no LiteLLM virtual key at all. LiteLLM's own
+# custom_auth (configmap-callbacks.yaml) verifies the SA JWT directly and
+# fully replaces the virtual-key check for these callers; non-JWT callers
+# (the existing master/virtual key path) are unaffected. The JWT travels
+# in the standard Authorization header.
+saAuth:
+  issuer: https://kubernetes.default.svc.cluster.local
+  audience: litellm
+  # Deny-by-default: ONLY these ServiceAccounts may authenticate via JWT.
+  # Empty means no SA is allowed at all -- JWT auth is effectively off,
+  # not open. Master/virtual keys are unaffected either way.
+  # maxBudget (USD, optional): applied to the LiteLLM User auto-created for
+  # this SA on its first request -- see configmap-callbacks.yaml custom_auth.py.
+  # Omit for no budget limit.
+  allowedServiceAccounts: []
+  # - namespace: my-namespace
+  #   name: my-sa
+  #   maxBudget: 10
+
+livenessProbe:
+  path: /health/liveliness
+  initialDelaySeconds: 0
+  periodSeconds: 15
+  timeoutSeconds: 5
+  successThreshold: 1
+  failureThreshold: 5
+
+readinessProbe:
+  path: /health/readiness
+  initialDelaySeconds: 0
+  periodSeconds: 10
+  timeoutSeconds: 5
+  successThreshold: 1
+  failureThreshold: 3
+
+startupProbe:
+  path: /health/readiness
+  initialDelaySeconds: 0
+  periodSeconds: 10
+  timeoutSeconds: 5
+  successThreshold: 1
+  failureThreshold: 30
+
+proxyConfigMap:
+  create: true
+  # When create is false, mount this existing ConfigMap instead.
+  name: ""
+  key: config.yaml
+
+proxy_config:
+  model_list: []
+  # - model_name: gpt-4o
+  #   litellm_params:
+  #     model: openai/gpt-4o
+  #     api_key: os.environ/OPENAI_API_KEY
+  litellm_settings:
+    callbacks:
+      - prometheus
+    require_auth_for_metrics_endpoint: false
+    json_logs: true # machine-readable log lines
+    request_correlation_in_logs: true # stamp trace_id/session_id per line
+  general_settings:
+    # Replaces LiteLLM's virtual-key check with k8s ServiceAccount JWT
+    # verification for SA callers; master/virtual keys still work for
+    # everyone else. See configmap-callbacks.yaml custom_auth.py.
+    custom_auth: custom_auth.user_api_key_auth
+    # LiteLLM skips common_checks() (team/user budget, model-access, etc.)
+    # for any request authenticated via custom_auth unless this is set --
+    # needed so the per-SA User budget set in custom_auth.py is actually
+    # enforced, not just recorded.
+    custom_auth_run_common_checks: true
+
+resources: {}
+
+# Extra volumes/mounts for the LiteLLM container. The custom_auth callbacks
+# volume is always mounted by the chart.
+volumes: []
+volumeMounts: []
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+db:
+  # Postgres host (optionally host:port). Ignored if secret.endpointKey is set.
+  endpoint: ""
+  database: litellm
+  url: postgresql://$(DATABASE_USERNAME):$(DATABASE_PASSWORD)@$(DATABASE_HOST)/$(DATABASE_NAME)
+  # Existing Secret holding the DB credentials. Never created by the chart.
+  secret:
+    name: litellm-db
+    usernameKey: username
+    passwordKey: password
+    endpointKey: ""
+
+migrationJob:
+  enabled: true
+  backoffLimit: 4
+  activeDeadlineSeconds: 1800
+  serviceAccountName: ""
+  annotations: {}
+  ttlSecondsAfterFinished: 120
+  resources: {}
+  extraContainers: []
+  hooks:
+    # Argo CD also honours the helm hook (pre-install/pre-upgrade -> PreSync),
+    # so the argocd annotation is only needed to override that mapping.
+    argocd:
+      enabled: false
+    helm:
+      enabled: true
+
+logLevel: INFO
+envVars: {}
+extraEnvVars: []
+
+# Existing Secret holding the LiteLLM master key. Never created by the chart.
+masterKeySecret:
+  name: litellm-master-key
+  key: masterKey
+command: {}
+args: {}
+
+serviceMonitor:
+  enabled: false
+  labels: {}
+  annotations: {}
+  interval: 15s
+  scrapeTimeout: 10s
+  relabelings: []
+  namespaceSelector:
+    matchNames: []
