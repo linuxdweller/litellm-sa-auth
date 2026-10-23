@@ -1,0 +1,209 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "litellm.fullname" . }}-callbacks
+  labels:
+    {{- include "litellm.labels" . | nindent 4 }}
+data:
+  custom_auth.py: |
+    import time
+
+    import httpx
+    import jwt
+    from jwt import InvalidTokenError
+    from jwt.algorithms import RSAAlgorithm
+
+    from litellm.proxy._types import UserAPIKeyAuth
+
+    JWKS_URL = "https://kubernetes.default.svc/openid/v1/jwks"
+    SA_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    SA_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+    JWKS_CACHE_SECONDS = 900
+    ISSUER = "{{ .Values.saAuth.issuer }}"
+    AUDIENCE = "{{ .Values.saAuth.audience }}"
+    # Deny-by-default allowlist: only these ServiceAccounts may
+    # authenticate via JWT. Empty = no SA is allowed (JWT auth is
+    # effectively off, not open) -- see values.yaml saAuth.allowedServiceAccounts.
+    ALLOWED_SERVICE_ACCOUNTS = frozenset([
+        {{- range .Values.saAuth.allowedServiceAccounts }}
+        "system:serviceaccount:{{ .namespace }}:{{ .name }}",
+        {{- end }}
+    ])
+
+    # Per-SA budget (USD) applied to the LiteLLM User auto-created for that SA
+    # on its first request -- see _ensure_sa_user_budget. None = no limit.
+    SA_MAX_BUDGETS = {
+        {{- range .Values.saAuth.allowedServiceAccounts }}
+        "system:serviceaccount:{{ .namespace }}:{{ .name }}": {{ if .maxBudget }}{{ .maxBudget }}{{ else }}None{{ end }},
+        {{- end }}
+    }
+
+    # This pod's own default ServiceAccount is already authorized to read
+    # the cluster's /openid/v1/jwks (bound to system:serviceaccounts by
+    # k8s default, same as any other SA) -- no extra RBAC needed. Cached
+    # for JWKS_CACHE_SECONDS; the SA token itself is re-read from disk on
+    # every actual fetch since kubelet rotates it in place.
+    _jwks_cache = {"fetched_at": 0.0, "keys": {}}
+
+
+    def _load_jwks():
+        now = time.monotonic()
+        if _jwks_cache["keys"] and now - _jwks_cache["fetched_at"] < JWKS_CACHE_SECONDS:
+            return _jwks_cache["keys"]
+        try:
+            with open(SA_TOKEN_PATH) as f:
+                token = f.read().strip()
+            resp = httpx.get(
+                JWKS_URL,
+                headers={"Authorization": f"Bearer {token}"},
+                verify=SA_CA_PATH,
+                timeout=5.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            _jwks_cache["keys"] = {k["kid"]: k for k in data.get("keys", [])}
+            _jwks_cache["fetched_at"] = now
+        except Exception:
+            if not _jwks_cache["keys"]:
+                raise
+            # Transient fetch failure -- serve the stale cache rather than
+            # fail every request; signing keys rotate rarely.
+        return _jwks_cache["keys"]
+
+
+    def _verify_sa_jwt(token):
+        header = jwt.get_unverified_header(token)
+        jwk = _load_jwks().get(header.get("kid"))
+        if jwk is None:
+            raise InvalidTokenError(f"Unknown signing key id: {header.get('kid')}")
+        public_key = RSAAlgorithm.from_jwk(jwk)
+        return jwt.decode(
+            token,
+            key=public_key,
+            algorithms=["RS256"],
+            audience=AUDIENCE,
+            issuer=ISSUER,
+        )
+
+
+    async def _ensure_sa_user_budget(sub: str) -> None:
+        """Create the LiteLLM User for this SA on first request and pin its
+        max_budget to SA_MAX_BUDGETS[sub]. get_user_object(user_id_upsert=True)
+        only applies litellm's one global default_internal_user_params on
+        creation, so the per-SA figure still needs this explicit patch --
+        plus a cache refresh, since the upsert call above already cached the
+        pre-patch row under this user_id and common_checks() (called right
+        after auth, per custom_auth_run_common_checks) would otherwise read
+        that stale cached budget on this very request.
+        """
+        from litellm.proxy._types import LiteLLM_UserTable
+        from litellm.proxy.auth.auth_checks import (
+            _cache_management_object,
+            _user_table,
+            get_user_object,
+        )
+        from litellm.proxy.proxy_server import (
+            prisma_client,
+            proxy_logging_obj,
+            user_api_key_cache,
+        )
+        from litellm.repositories.user_repository import UserRepository
+
+        user_obj = await get_user_object(
+            user_id=sub,
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            user_id_upsert=True,
+            proxy_logging_obj=proxy_logging_obj,
+        )
+        budget = SA_MAX_BUDGETS.get(sub)
+        if user_obj is not None and user_obj.max_budget != budget:
+            await _user_table(UserRepository(prisma_client)).update(
+                where={"user_id": sub},
+                data={"max_budget": budget},
+            )
+            user_obj.max_budget = budget
+            await _cache_management_object(
+                key=sub,
+                value=user_obj,
+                user_api_key_cache=user_api_key_cache,
+                proxy_logging_obj=proxy_logging_obj,
+                model_type=LiteLLM_UserTable,
+            )
+
+
+    async def user_api_key_auth(request, api_key: str) -> UserAPIKeyAuth:
+        """Replaces LiteLLM's virtual-key auth with k8s ServiceAccount JWT
+        verification for callers using their own SA identity. Non-JWT
+        callers (the existing master/virtual key path) fall through to
+        LiteLLM's own check unchanged -- see values.yaml saAuth.
+        """
+        token = api_key[len("Bearer ") :] if api_key.startswith("Bearer ") else api_key
+
+        try:
+            claims = _verify_sa_jwt(token)
+        except Exception:
+            # Not a valid SA JWT -- could be a plain LiteLLM key, a bad/
+            # expired JWT, or a transient JWKS-fetch failure. Any of those
+            # fall through to the key check below rather than hard-failing
+            # here, same as a master/virtual key request would.
+            claims = None
+
+        if claims is not None:
+            sub = claims["sub"]  # system:serviceaccount:<namespace>:<name>
+            if sub not in ALLOWED_SERVICE_ACCOUNTS:
+                raise Exception(f"ServiceAccount not authorized: {sub}")
+            parts = sub.split(":")
+            namespace = parts[2] if len(parts) == 4 else None
+            await _ensure_sa_user_budget(sub)
+            # Not team_id: that makes common_checks() look up a real
+            # LiteLLM_TeamTable row for "namespace" and 404 the whole
+            # request when none exists (we don't provision teams, only
+            # per-SA Users). Record the namespace as plain metadata instead.
+            return UserAPIKeyAuth(
+                api_key=sub,
+                user_id=sub,
+                metadata={"namespace": namespace},
+                jwt_claims=claims,
+            )
+
+        # Not a JWT -- validate against the master key / DB-backed virtual
+        # keys ourselves. We can't call litellm's own user_api_key_auth()
+        # here: it dispatches straight back to general_settings.custom_auth
+        # (this very function), which is infinite recursion, not a fallback.
+        import secrets
+
+        from litellm.constants import LITELLM_PROXY_MASTER_KEY_ALIAS
+        from litellm.proxy._types import LitellmUserRoles
+        from litellm.proxy.proxy_server import litellm_proxy_admin_name, master_key
+
+        if master_key and secrets.compare_digest(token, master_key):
+            # user_role=PROXY_ADMIN is required for admin-only endpoints
+            # (/user/info on another user, /user/delete, etc.) -- without
+            # it the master key could call models but not manage users.
+            # Mirrors litellm's own master-key UserAPIKeyAuth construction
+            # (api_key aliased, never the raw master key, to keep it out of
+            # spend logs/metrics labels).
+            return UserAPIKeyAuth(
+                api_key=LITELLM_PROXY_MASTER_KEY_ALIAS,
+                user_id=litellm_proxy_admin_name,
+                user_role=LitellmUserRoles.PROXY_ADMIN,
+            )
+
+        from litellm.proxy.auth.auth_checks import get_key_object
+        from litellm.proxy.proxy_server import (
+            prisma_client,
+            proxy_logging_obj,
+            user_api_key_cache,
+        )
+        from litellm.proxy.utils import hash_token
+
+        try:
+            return await get_key_object(
+                hashed_token=hash_token(token),
+                prisma_client=prisma_client,
+                user_api_key_cache=user_api_key_cache,
+                proxy_logging_obj=proxy_logging_obj,
+            )
+        except Exception as e:
+            raise Exception(f"Invalid LiteLLM API key: {e}")

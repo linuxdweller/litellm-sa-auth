@@ -1,0 +1,31 @@
+{{- if .Values.httproute.enabled }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: {{ include "litellm.fullname" . }}
+  labels:
+    {{- include "litellm.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ .Values.httproute.gateway.name }}
+      namespace: {{ .Values.httproute.gateway.namespace }}
+      group: gateway.networking.k8s.io
+      kind: Gateway
+  hostnames:
+    {{- toYaml .Values.httproute.hostnames | nindent 4 }}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: {{ include "litellm.fullname" . }}
+          port: {{ .Values.service.port }}
+          group: ""
+          kind: Service
+          weight: 1
+      {{- with .Values.httproute.timeouts }}
+      timeouts:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

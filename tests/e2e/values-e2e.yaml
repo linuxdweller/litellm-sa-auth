@@ -1,0 +1,22 @@
+db:
+  endpoint: postgres
+
+saAuth:
+  allowedServiceAccounts:
+    - namespace: litellm
+      name: sa-jwt-test
+      maxBudget: 0.01
+
+proxy_config:
+  model_list:
+    # No upstream provider: mock_response short-circuits the call, and the
+    # explicit per-token pricing gives each call a deterministic, non-zero
+    # cost so budget enforcement can be exercised in a handful of requests.
+    - model_name: e2e-mock
+      litellm_params:
+        model: openai/e2e-mock
+        api_key: not-used
+        mock_response: "hello from the e2e mock"
+      model_info:
+        input_cost_per_token: 0.0001
+        output_cost_per_token: 0.0001
