@@ -2,7 +2,7 @@ stages:
   - test
   - publish
 
-# Branch pipelines run lint + E2E; tag pipelines (vX.Y.Z) additionally
+# Branch pipelines run lint; tag pipelines (vX.Y.Z) additionally
 # publish the chart. MR pipelines are skipped when a branch pipeline already
 # covers the same commit.
 workflow:
@@ -15,9 +15,6 @@ workflow:
 
 variables:
   CHART_DIR: charts/litellm
-  HELM_VERSION: v3.19.0
-  KIND_VERSION: v0.30.0
-  KUBECTL_VERSION: v1.34.1
 
 lint:
   stage: test
@@ -25,39 +22,14 @@ lint:
   script:
     - helm lint "$CHART_DIR" -f tests/e2e/values-e2e.yaml
 
-# kind runs inside a privileged docker:dind service. On the Kubernetes
-# executor services share the job pod's network namespace, so the kind
-# API server that dind publishes on 127.0.0.1 is reachable from the job.
-e2e:
-  stage: test
-  image: docker:28.5.1-cli
-  services:
-    - name: docker:28.5.1-dind
-      command: ["--tls=false", "--host=tcp://0.0.0.0:2375"]
-  variables:
-    DOCKER_HOST: tcp://localhost:2375
-    DOCKER_TLS_CERTDIR: ""
-  timeout: 45m
-  before_script:
-    - apk add --no-cache bash curl python3 coreutils
-    - curl -fsSLo /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-    - curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
-    - chmod +x /usr/local/bin/kind /usr/local/bin/kubectl
-    - curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" | tar -xz -C /usr/local/bin --strip-components=1 linux-amd64/helm
-    - for i in $(seq 1 60); do docker info >/dev/null 2>&1 && break; sleep 1; done
-    - docker info
-  script:
-    - tests/e2e/run.sh
-  after_script:
-    - kubectl get pods -A -o wide || true
-    - kubectl logs -n litellm deploy/litellm --tail=200 || true
-
 # Publishes oci://oci.git.f6n.io/amit/litellm-sa-auth/litellm:<X.Y.Z> for
-# tag vX.Y.Z. The project is public, so pulls need no credentials.
+# tag vX.Y.Z. The project is public, so pulls need no credentials. The E2E
+# suite isn't run here: kind needs a privileged Docker daemon and the shared
+# Kubernetes runner is unprivileged -- run `make e2e` locally before tagging.
 publish:
   stage: publish
   image: alpine/helm:4.2.3
-  needs: [lint, e2e]
+  needs: [lint]
   rules:
     - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/
   script:

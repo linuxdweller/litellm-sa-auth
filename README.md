@@ -1,5 +1,18 @@
 # LiteLLM On K8s With SA Auth
 
+## Installing
+
+Tagged releases (`vX.Y.Z`) are published by CI as an OCI chart; no login
+needed:
+
+```sh
+helm install litellm oci://oci.git.f6n.io/amit/litellm-sa-auth/litellm --version 0.1.0
+```
+
+CI only lints and publishes: the E2E suite needs a privileged Docker daemon
+for kind, which the shared runner doesn't provide, so run `make e2e` locally
+before tagging.
+
 ## Layout
 
 ```
